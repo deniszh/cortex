@@ -16,3 +16,5 @@ pkg/querier/frontend/frontend.pb.go
 pkg/ring/ring.pb.go
 pkg/chunk/storage/caching_storage_client.pb.go
 images/
+compose/data
+compose/config/prometheus/data
