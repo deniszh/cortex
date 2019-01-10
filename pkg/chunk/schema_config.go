@@ -26,7 +26,8 @@ const (
 type PeriodConfig struct {
 	From        model.Time          `yaml:"-"`              // used when working with config
 	FromStr     string              `yaml:"from,omitempty"` // used when loading from yaml
-	Store       string              `yaml:"store"`
+	IndexType   string              `yaml:"store"`          // type of index client to use.
+	ObjectType  string              `yaml:"object_store"`   // type of object client to use; if omitted, defaults to store.
 	Schema      string              `yaml:"schema"`
 	IndexTables PeriodicTableConfig `yaml:"index"`
 	ChunkTables PeriodicTableConfig `yaml:"chunks,omitempty"`
@@ -95,10 +96,10 @@ func (cfg *SchemaConfig) translate() error {
 
 	add := func(t string, f model.Time) {
 		cfg.Configs = append(cfg.Configs, PeriodConfig{
-			From:    f,
-			FromStr: f.Time().Format("2006-01-02"),
-			Schema:  t,
-			Store:   cfg.legacy.StorageClient,
+			From:      f,
+			FromStr:   f.Time().Format("2006-01-02"),
+			Schema:    t,
+			IndexType: cfg.legacy.StorageClient,
 			IndexTables: PeriodicTableConfig{
 				Prefix: cfg.legacy.OriginalTableName,
 				Tags:   cfg.legacy.IndexTables.Tags,
@@ -132,15 +133,15 @@ func (cfg *SchemaConfig) translate() error {
 	})
 	if cfg.legacy.ChunkTablesFrom.IsSet() {
 		cfg.ForEachAfter(cfg.legacy.ChunkTablesFrom.Time, func(config *PeriodConfig) {
-			if config.Store == "aws" {
-				config.Store = "aws-dynamo"
+			if config.IndexType == "aws" {
+				config.IndexType = "aws-dynamo"
 			}
 			config.ChunkTables = cfg.legacy.ChunkTables
 		})
 	}
 	if cfg.legacy.BigtableColumnKeyFrom.IsSet() {
 		cfg.ForEachAfter(cfg.legacy.BigtableColumnKeyFrom.Time, func(config *PeriodConfig) {
-			config.Store = "gcp-columnkey"
+			config.IndexType = "gcp-columnkey"
 		})
 	}
 	return nil
@@ -334,19 +335,24 @@ func (cfg *AutoScalingConfig) RegisterFlags(argPrefix string, f *flag.FlagSet) {
 	f.Float64Var(&cfg.TargetValue, argPrefix+".target-value", 80, "DynamoDB target ratio of consumed capacity to provisioned capacity.")
 }
 
-func (cfg *PeriodicTableConfig) periodicTables(from, through model.Time, pCfg ProvisionConfig, beginGrace, endGrace time.Duration) []TableDesc {
+func (cfg *PeriodicTableConfig) periodicTables(from, through model.Time, pCfg ProvisionConfig, beginGrace, endGrace time.Duration, retention time.Duration) []TableDesc {
 	var (
 		periodSecs     = int64(cfg.Period / time.Second)
 		beginGraceSecs = int64(beginGrace / time.Second)
 		endGraceSecs   = int64(endGrace / time.Second)
 		firstTable     = from.Unix() / periodSecs
 		lastTable      = through.Unix() / periodSecs
+		tablesToKeep   = int64(int64(retention/time.Second) / periodSecs)
 		now            = mtime.Now().Unix()
 		result         = []TableDesc{}
 	)
 	// If through ends on 00:00 of the day, don't include the upcoming day
 	if through.Unix()%secondsInDay == 0 {
 		lastTable--
+	}
+	// Don't make tables further back than the configured retention
+	if retention > 0 && lastTable > tablesToKeep && lastTable-firstTable >= tablesToKeep {
+		firstTable = lastTable - tablesToKeep
 	}
 	for i := firstTable; i <= lastTable; i++ {
 		table := TableDesc{

@@ -14,6 +14,7 @@ import (
 	"github.com/segmentio/fasthash/fnv1a"
 
 	"github.com/cortexproject/cortex/pkg/ingester/client"
+	"github.com/cortexproject/cortex/pkg/ingester/index"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/extract"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
@@ -53,7 +54,7 @@ type userState struct {
 	fpLocker            *fingerprintLocker
 	fpToSeries          *seriesMap
 	mapper              *fpMapper
-	index               *invertedIndex
+	index               *index.InvertedIndex
 	ingestedAPISamples  *ewmaRate
 	ingestedRuleSamples *ewmaRate
 
@@ -146,7 +147,7 @@ func (us *userStates) getOrCreateSeries(ctx context.Context, labels labelPairs) 
 			limits:              us.limits,
 			fpToSeries:          newSeriesMap(),
 			fpLocker:            newFingerprintLocker(16 * 1024),
-			index:               newInvertedIndex(),
+			index:               index.New(),
 			ingestedAPISamples:  newEWMARate(0.2, us.cfg.RateUpdatePeriod),
 			ingestedRuleSamples: newEWMARate(0.2, us.cfg.RateUpdatePeriod),
 			seriesInMetric:      seriesInMetric,
@@ -187,6 +188,7 @@ func (u *userState) getSeries(metric labelPairs) (model.Fingerprint, *memorySeri
 	// serially), and the overshoot in allowed series would be minimal.
 	if u.fpToSeries.length() >= u.limits.MaxSeriesPerUser(u.userID) {
 		u.fpLocker.Unlock(fp)
+		validation.DiscardedSamples.WithLabelValues(validation.RateLimited, u.userID).Inc()
 		return fp, nil, httpgrpc.Errorf(http.StatusTooManyRequests, "per-user series limit (%d) exceeded", u.limits.MaxSeriesPerUser(u.userID))
 	}
 
@@ -198,6 +200,7 @@ func (u *userState) getSeries(metric labelPairs) (model.Fingerprint, *memorySeri
 
 	if !u.canAddSeriesFor(string(metricName)) {
 		u.fpLocker.Unlock(fp)
+		validation.DiscardedSamples.WithLabelValues(validation.RateLimited, u.userID).Inc()
 		return fp, nil, httpgrpc.Errorf(http.StatusTooManyRequests, "per-metric series limit (%d) exceeded for %s: %s", u.limits.MaxSeriesPerMetric(u.userID), metricName, metric)
 	}
 
@@ -207,13 +210,13 @@ func (u *userState) getSeries(metric labelPairs) (model.Fingerprint, *memorySeri
 
 	series = newMemorySeries(metric)
 	u.fpToSeries.put(fp, series)
-	u.index.add(metric, fp)
+	u.index.Add(metric, fp)
 
 	return fp, series, nil
 }
 
 func (u *userState) canAddSeriesFor(metric string) bool {
-	shard := &u.seriesInMetric[hashFP(model.Fingerprint(fnv1a.HashString64(string(metric))))%metricCounterShards]
+	shard := &u.seriesInMetric[util.HashFP(model.Fingerprint(fnv1a.HashString64(string(metric))))%metricCounterShards]
 	shard.mtx.Lock()
 	defer shard.mtx.Unlock()
 
@@ -226,7 +229,7 @@ func (u *userState) canAddSeriesFor(metric string) bool {
 
 func (u *userState) removeSeries(fp model.Fingerprint, metric labelPairs) {
 	u.fpToSeries.del(fp)
-	u.index.delete(metric, fp)
+	u.index.Delete(metric, fp)
 
 	metricNameB, err := extract.MetricNameFromLabelPairs(metric)
 	if err != nil {
@@ -236,7 +239,7 @@ func (u *userState) removeSeries(fp model.Fingerprint, metric labelPairs) {
 	}
 	metricName := string(metricNameB)
 
-	shard := &u.seriesInMetric[hashFP(model.Fingerprint(fnv1a.HashString64(string(metricName))))%metricCounterShards]
+	shard := &u.seriesInMetric[util.HashFP(model.Fingerprint(fnv1a.HashString64(string(metricName))))%metricCounterShards]
 	shard.mtx.Lock()
 	defer shard.mtx.Unlock()
 
@@ -256,7 +259,7 @@ func (u *userState) forSeriesMatching(ctx context.Context, allMatchers []*labels
 	defer log.Finish()
 
 	filters, matchers := util.SplitFiltersAndMatchers(allMatchers)
-	fps := u.index.lookup(matchers)
+	fps := u.index.Lookup(matchers)
 	if len(fps) > u.limits.MaxSeriesPerQuery(u.userID) {
 		return httpgrpc.Errorf(http.StatusRequestEntityTooLarge, "exceeded maximum number of series in a query")
 	}
@@ -266,6 +269,10 @@ func (u *userState) forSeriesMatching(ctx context.Context, allMatchers []*labels
 	// fps is sorted, lock them in order to prevent deadlocks
 outer:
 	for _, fp := range fps {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		u.fpLocker.Lock(fp)
 		series, ok := u.fpToSeries.get(fp)
 		if !ok {

@@ -29,20 +29,17 @@ import (
 	"github.com/cortexproject/cortex/pkg/util/validation"
 	billing "github.com/weaveworks/billing-client"
 	"github.com/weaveworks/common/httpgrpc"
+	"github.com/weaveworks/common/instrument"
 	"github.com/weaveworks/common/user"
 )
 
-const (
-	rateLimited = "rate_limited"
-)
-
 var (
-	queryDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	queryDuration = instrument.NewHistogramCollector(promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "cortex",
 		Name:      "distributor_query_duration_seconds",
 		Help:      "Time spent executing expression queries.",
 		Buckets:   []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30},
-	}, []string{"method", "status_code"})
+	}, []string{"method", "status_code"}))
 	receivedSamples = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "cortex",
 		Name:      "distributor_received_samples_total",
@@ -288,7 +285,7 @@ func (d *Distributor) Push(ctx context.Context, req *client.WriteRequest) (*clie
 	if !limiter.AllowN(time.Now(), numSamples) {
 		// Return a 4xx here to have the client discard the data and not retry. If a client
 		// is sending too much data consistently we will unlikely ever catch up otherwise.
-		validation.DiscardedSamples.WithLabelValues(rateLimited, userID).Add(float64(numSamples))
+		validation.DiscardedSamples.WithLabelValues(validation.RateLimited, userID).Add(float64(numSamples))
 		return nil, httpgrpc.Errorf(http.StatusTooManyRequests, "ingestion rate limit (%v) exceeded while adding %d samples", limiter.Limit(), numSamples)
 	}
 

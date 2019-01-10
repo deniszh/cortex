@@ -17,7 +17,7 @@ type tableClient struct {
 
 // NewTableClient returns a new TableClient.
 func NewTableClient(ctx context.Context, cfg Config) (chunk.TableClient, error) {
-	client, err := bigtable.NewAdminClient(ctx, cfg.project, cfg.instance, instrumentation()...)
+	client, err := bigtable.NewAdminClient(ctx, cfg.Project, cfg.Instance, instrumentation()...)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +72,14 @@ func alreadyExistsError(err error) bool {
 	// Have filed bug upstream: https://github.com/GoogleCloudPlatform/google-cloud-go/issues/672
 	serr, ok := status.FromError(err)
 	return ok && strings.Contains(serr.Message(), "already exists")
+}
+
+func (c *tableClient) DeleteTable(ctx context.Context, name string) error {
+	if err := c.client.DeleteTable(ctx, name); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (c *tableClient) DescribeTable(ctx context.Context, name string) (desc chunk.TableDesc, isActive bool, err error) {
