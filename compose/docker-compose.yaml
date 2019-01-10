@@ -112,7 +112,7 @@ services:
                "-consul.hostname=consul:8500",
                "-distributor.replication-factor=1" ]
 
-  ingester1:
+  ingester:
     image: quay.io/cortexproject/ingester:latest
     ports:
       - "84:80"
@@ -128,31 +128,6 @@ services:
                "-server.grpc-listen-port=9094",
                "-ingester.port=9094",
                "-ingester.join-after=5s",
-               "-ingester.claim-on-rollout=false",
-               "-chunk.storage-client=cassandra",
-               "-consul.hostname=consul:8500",
-               "-cassandra.addresses=cassandra",
-               "-cassandra.keyspace=cortex_test",
-               "-cassandra.timeout=30000ms",
-               "-memcached.hostname=memcached",
-               "-memcached.timeout=100ms" ]
-
-  ingester2:
-    image: quay.io/cortexproject/ingester:latest
-    ports:
-      - "85:80"
-    depends_on:
-        consul:
-          condition: service_started
-        memcached:
-          condition: service_started
-        cassandra:
-          condition: service_healthy
-    command: [ "-log.level=debug",
-               "-server.http-listen-port=80",
-               "-server.grpc-listen-port=9094",
-               "-ingester.port=9094",
-               "-ingester.join-after=7s",
                "-ingester.claim-on-rollout=false",
                "-chunk.storage-client=cassandra",
                "-consul.hostname=consul:8500",
