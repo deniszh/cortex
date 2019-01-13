@@ -153,9 +153,6 @@ services:
     command: [ "-log.level=debug",
               "-server.http-listen-port=80",
               "-querier.frontend-address=query-frontend:9095",
-              "-querier.align-querier-with-step=true",
-              "-querier.split-queries-by-day=true",
-              "-querier.cache-results=true",
               "-consul.hostname=consul:8500",
               "-chunk.storage-client=cassandra",
               "-cassandra.addresses=cassandra",
@@ -211,8 +208,14 @@ services:
       - "9095:9095"
     depends_on:
       - consul
-    command: [ "-server.http-listen-port=80",
-               "-server.grpc-listen-port=9095" ]
+    command: [ "-log.level=debug",
+              "-querier.align-querier-with-step=true",
+              "-querier.split-queries-by-day=true",
+              "-querier.cache-results=true",
+              "-memcached.hostname=memcached",
+              "-memcached.timeout=100ms",
+              "-server.http-listen-port=80",
+              "-server.grpc-listen-port=9095" ]
 
   prometheus:
     image: prom/prometheus:latest
