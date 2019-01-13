@@ -10,6 +10,7 @@ cortex_data_source=$(cat <<EOF
   "basicAuth":false
 }
 EOF
+)
 prom_data_source=$(cat <<XUI
 {
   "name":"Prometheus",

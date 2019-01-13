@@ -110,6 +110,7 @@ services:
     command: [ "-log.level=debug",
                "-server.http-listen-port=80",
                "-consul.hostname=consul:8500",
+               "-distributor.shard-by-all-labels=true",
                "-distributor.replication-factor=1" ]
 
   ingester:
@@ -129,6 +130,7 @@ services:
                "-ingester.port=9094",
                "-ingester.join-after=5s",
                "-ingester.claim-on-rollout=false",
+               "-ingester.normalise-tokens=true",
                "-chunk.storage-client=cassandra",
                "-consul.hostname=consul:8500",
                "-cassandra.addresses=cassandra",
@@ -151,12 +153,16 @@ services:
     command: [ "-log.level=debug",
               "-server.http-listen-port=80",
               "-querier.frontend-address=query-frontend:9095",
+              "-querier.align-querier-with-step=true",
+              "-querier.split-queries-by-day=true",
+              "-querier.cache-results=true",
               "-consul.hostname=consul:8500",
               "-chunk.storage-client=cassandra",
               "-cassandra.addresses=cassandra",
               "-cassandra.keyspace=cortex_test",
               "-cassandra.timeout=30000ms",
               "-distributor.replication-factor=1",
+              "-distributor.extra-query-delay=100ms",
               "-memcached.hostname=memcached",
               "-memcached.timeout=100ms" ]
 
@@ -181,6 +187,7 @@ services:
               "-cassandra.keyspace=cortex_test",
               "-cassandra.timeout=30000ms",
               "-distributor.replication-factor=1",
+              "-distributor.extra-query-delay=100ms",
               "-memcached.hostname=memcached",
               "-memcached.timeout=100ms" ]
 
