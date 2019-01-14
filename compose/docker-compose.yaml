@@ -68,7 +68,7 @@ services:
     ports:
       - "81:80"
     volumes:
-      [ "./data/dbpwd:/etc/dbpwd" ]
+      [ "./data/dbpwd.txt:/etc/dbpwd.txt" ]
     depends_on:
       - configs-db
       - consul
@@ -76,7 +76,7 @@ services:
                "-server.http-listen-port=80",
                "-database.uri=postgres://postgres@configs-db/configs?sslmode=disable",
                "-database.migrations=/migrations",
-               "-database.password-file=/etc/dbpwd" ]
+               "-database.password-file=/etc/dbpwd.txt" ]
 
   frontend:
     image: nginx:latest
