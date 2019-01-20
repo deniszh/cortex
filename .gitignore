@@ -16,3 +16,4 @@ pkg/querier/frontend/frontend.pb.go
 pkg/ring/ring.pb.go
 pkg/chunk/storage/caching_index_client.pb.go
 images/
+compose/data
