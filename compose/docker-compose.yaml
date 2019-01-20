@@ -85,7 +85,7 @@ services:
         "./config/nginx/ssl:/etc/nginx/ssl" ]
     ports:
      - "443:443"
-     - "80:80"
+     - "8080:80"
     depends_on:
       - distributor
       - query-frontend
@@ -204,7 +204,7 @@ services:
   query-frontend:
     image: quay.io/cortexproject/query-frontend:latest
     ports:
-      - "8080:80"
+      - "8081:80"
       - "9095:9095"
     depends_on:
       - consul
