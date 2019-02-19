@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
 
-	"github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/go-kit/kit/log/level"
 	"github.com/gogo/status"
 	"github.com/prometheus/client_golang/prometheus"
@@ -91,7 +90,6 @@ type Config struct {
 	MaxChunkAge       time.Duration
 	ChunkAgeJitter    time.Duration
 	ConcurrentFlushes int
-	ChunkEncoding     string
 
 	RateUpdatePeriod time.Duration
 
@@ -111,7 +109,6 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.MaxChunkAge, "ingester.max-chunk-age", 12*time.Hour, "Maximum chunk age before flushing.")
 	f.DurationVar(&cfg.ChunkAgeJitter, "ingester.chunk-age-jitter", 20*time.Minute, "Range of time to subtract from MaxChunkAge to spread out flushes")
 	f.IntVar(&cfg.ConcurrentFlushes, "ingester.concurrent-flushes", 50, "Number of concurrent goroutines flushing to dynamodb.")
-	f.StringVar(&cfg.ChunkEncoding, "ingester.chunk-encoding", "1", "Encoding version to use for chunks.")
 	f.DurationVar(&cfg.RateUpdatePeriod, "ingester.rate-update-period", 15*time.Second, "Period with which to update the per-user ingestion rates.")
 
 	// DEPRECATED, no-op
@@ -158,10 +155,6 @@ type ChunkStore interface {
 func New(cfg Config, clientConfig client.Config, limits *validation.Overrides, chunkStore ChunkStore) (*Ingester, error) {
 	if cfg.ingesterClientFactory == nil {
 		cfg.ingesterClientFactory = client.MakeIngesterClient
-	}
-
-	if err := encoding.DefaultEncoding.Set(cfg.ChunkEncoding); err != nil {
-		return nil, err
 	}
 
 	i := &Ingester{
@@ -453,6 +446,25 @@ func (i *Ingester) LabelValues(ctx old_ctx.Context, req *client.LabelValuesReque
 	resp := &client.LabelValuesResponse{}
 	for _, v := range state.index.LabelValues(model.LabelName(req.LabelName)) {
 		resp.LabelValues = append(resp.LabelValues, string(v))
+	}
+
+	return resp, nil
+}
+
+// LabelNames return all the label names.
+func (i *Ingester) LabelNames(ctx old_ctx.Context, req *client.LabelNamesRequest) (*client.LabelNamesResponse, error) {
+	i.userStatesMtx.RLock()
+	defer i.userStatesMtx.RUnlock()
+	state, ok, err := i.userStates.getViaContext(ctx)
+	if err != nil {
+		return nil, err
+	} else if !ok {
+		return &client.LabelNamesResponse{}, nil
+	}
+
+	resp := &client.LabelNamesResponse{}
+	for _, v := range state.index.LabelNames() {
+		resp.LabelNames = append(resp.LabelNames, string(v))
 	}
 
 	return resp, nil
