@@ -12,10 +12,11 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/log/level"
-	"github.com/json-iterator/go"
+	jsoniter "github.com/json-iterator/go"
 	opentracing "github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/weaveworks/common/httpgrpc"
 
 	client "github.com/cortexproject/cortex/pkg/ingester/client"
@@ -91,6 +92,15 @@ func (q QueryRangeRequest) toHTTPRequest(ctx context.Context) (*http.Request, er
 	return req.WithContext(ctx), nil
 }
 
+func (q QueryRangeRequest) logToSpan(ctx context.Context) {
+	if span := opentracing.SpanFromContext(ctx); span != nil {
+		span.LogFields(otlog.String("query", q.Query),
+			otlog.String("start", timestamp.Time(q.Start).String()),
+			otlog.String("end", timestamp.Time(q.End).String()),
+			otlog.Int64("step (ms)", q.Step))
+	}
+}
+
 // ParseTime parses the string into an int64, milliseconds since epoch.
 func ParseTime(s string) (int64, error) {
 	if t, err := strconv.ParseFloat(s, 64); err == nil {
@@ -162,7 +172,7 @@ func (s *SampleStream) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &stream); err != nil {
 		return err
 	}
-	s.Labels = client.ToLabelPairs(stream.Metric)
+	s.Labels = client.FromMetricsToLabelAdapters(stream.Metric)
 	s.Samples = stream.Values
 	return nil
 }
@@ -173,7 +183,7 @@ func (s *SampleStream) MarshalJSON() ([]byte, error) {
 		Metric model.Metric    `json:"metric"`
 		Values []client.Sample `json:"values"`
 	}{
-		Metric: client.FromLabelPairs(s.Labels),
+		Metric: client.FromLabelAdaptersToMetric(s.Labels),
 		Values: s.Samples,
 	}
 	return json.Marshal(stream)
@@ -278,11 +288,18 @@ func matrixMerge(resps []*APIResponse) []SampleStream {
 	output := map[string]*SampleStream{}
 	for _, resp := range resps {
 		for _, stream := range resp.Data.Result {
-			metric := client.FromLabelPairsToLabels(stream.Labels).String()
+			metric := client.FromLabelAdaptersToLabels(stream.Labels).String()
 			existing, ok := output[metric]
 			if !ok {
 				existing = &SampleStream{
 					Labels: stream.Labels,
+				}
+			}
+			// We need to make sure we don't repeat samples. This causes some visualisations to be broken in Grafana.
+			// The prometheus API is inclusive of start and end timestamps.
+			if len(existing.Samples) > 0 && len(stream.Samples) > 0 {
+				if existing.Samples[len(existing.Samples)-1].TimestampMs == stream.Samples[0].TimestampMs {
+					stream.Samples = stream.Samples[1:]
 				}
 			}
 			existing.Samples = append(existing.Samples, stream.Samples...)

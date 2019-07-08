@@ -15,7 +15,6 @@ package v1
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -23,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"time"
@@ -31,6 +31,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	jsoniter "github.com/json-iterator/go"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
@@ -75,13 +76,6 @@ const (
 	errorUnavailable errorType = "unavailable"
 	errorNotFound    errorType = "not_found"
 )
-
-var corsHeaders = map[string]string{
-	"Access-Control-Allow-Headers":  "Accept, Authorization, Content-Type, Origin",
-	"Access-Control-Allow-Methods":  "GET, OPTIONS",
-	"Access-Control-Allow-Origin":   "*",
-	"Access-Control-Expose-Headers": "Date",
-}
 
 var remoteReadQueries = prometheus.NewGauge(prometheus.GaugeOpts{
 	Namespace: namespace,
@@ -129,13 +123,6 @@ type apiFuncResult struct {
 	finalizer func()
 }
 
-// Enables cross-site script calls.
-func setCORS(w http.ResponseWriter) {
-	for h, v := range corsHeaders {
-		w.Header().Set(h, v)
-	}
-}
-
 type apiFunc func(r *http.Request) apiFuncResult
 
 // TSDBAdmin defines the tsdb interfaces used by the v1 API for admin operations.
@@ -165,6 +152,7 @@ type API struct {
 	logger                log.Logger
 	remoteReadSampleLimit int
 	remoteReadGate        *gate.Gate
+	CORSOrigin            *regexp.Regexp
 }
 
 func init() {
@@ -187,6 +175,7 @@ func NewAPI(
 	rr rulesRetriever,
 	remoteReadSampleLimit int,
 	remoteReadConcurrencyLimit int,
+	CORSOrigin *regexp.Regexp,
 ) *API {
 	return &API{
 		QueryEngine:           qe,
@@ -204,6 +193,7 @@ func NewAPI(
 		remoteReadSampleLimit: remoteReadSampleLimit,
 		remoteReadGate:        gate.New(remoteReadConcurrencyLimit),
 		logger:                logger,
+		CORSOrigin:            CORSOrigin,
 	}
 }
 
@@ -211,7 +201,7 @@ func NewAPI(
 func (api *API) Register(r *route.Router) {
 	wrap := func(f apiFunc) http.HandlerFunc {
 		hf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			setCORS(w)
+			httputil.SetCORS(w, api.CORSOrigin, r)
 			result := f(r)
 			if result.err != nil {
 				api.respondError(w, result.err, result.data)
@@ -241,6 +231,7 @@ func (api *API) Register(r *route.Router) {
 	r.Get("/label/:name/values", wrap(api.labelValues))
 
 	r.Get("/series", wrap(api.series))
+	r.Post("/series", wrap(api.series))
 	r.Del("/series", wrap(api.dropSeries))
 
 	r.Get("/targets", wrap(api.targets))
@@ -258,6 +249,11 @@ func (api *API) Register(r *route.Router) {
 	r.Post("/admin/tsdb/delete_series", wrap(api.deleteSeries))
 	r.Post("/admin/tsdb/clean_tombstones", wrap(api.cleanTombstones))
 	r.Post("/admin/tsdb/snapshot", wrap(api.snapshot))
+
+	r.Put("/admin/tsdb/delete_series", wrap(api.deleteSeries))
+	r.Put("/admin/tsdb/clean_tombstones", wrap(api.cleanTombstones))
+	r.Put("/admin/tsdb/snapshot", wrap(api.snapshot))
+
 }
 
 type queryData struct {
@@ -276,6 +272,7 @@ func (api *API) query(r *http.Request) apiFuncResult {
 		var err error
 		ts, err = parseTime(t)
 		if err != nil {
+			err = errors.Wrapf(err, "invalid parameter 'time'")
 			return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 		}
 	} else {
@@ -287,6 +284,7 @@ func (api *API) query(r *http.Request) apiFuncResult {
 		var cancel context.CancelFunc
 		timeout, err := parseDuration(to)
 		if err != nil {
+			err = errors.Wrapf(err, "invalid parameter 'timeout'")
 			return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 		}
 
@@ -296,6 +294,7 @@ func (api *API) query(r *http.Request) apiFuncResult {
 
 	qry, err := api.QueryEngine.NewInstantQuery(api.Queryable, r.FormValue("query"), ts)
 	if err != nil {
+		err = errors.Wrapf(err, "invalid parameter 'query'")
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
 
@@ -320,10 +319,12 @@ func (api *API) query(r *http.Request) apiFuncResult {
 func (api *API) queryRange(r *http.Request) apiFuncResult {
 	start, err := parseTime(r.FormValue("start"))
 	if err != nil {
+		err = errors.Wrapf(err, "invalid parameter 'start'")
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
 	end, err := parseTime(r.FormValue("end"))
 	if err != nil {
+		err = errors.Wrapf(err, "invalid parameter 'end'")
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
 	if end.Before(start) {
@@ -333,6 +334,7 @@ func (api *API) queryRange(r *http.Request) apiFuncResult {
 
 	step, err := parseDuration(r.FormValue("step"))
 	if err != nil {
+		err = errors.Wrapf(err, "invalid parameter 'step'")
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
 
@@ -353,6 +355,7 @@ func (api *API) queryRange(r *http.Request) apiFuncResult {
 		var cancel context.CancelFunc
 		timeout, err := parseDuration(to)
 		if err != nil {
+			err = errors.Wrap(err, "invalid parameter 'timeout'")
 			return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 		}
 
@@ -419,7 +422,7 @@ func (api *API) labelValues(r *http.Request) apiFuncResult {
 	name := route.Param(ctx, "name")
 
 	if !model.LabelNameRE.MatchString(name) {
-		return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("invalid label name: %q", name)}, nil, nil}
+		return apiFuncResult{nil, &apiError{errorBadData, errors.Errorf("invalid label name: %q", name)}, nil, nil}
 	}
 	q, err := api.Queryable.Querier(ctx, math.MinInt64, math.MaxInt64)
 	if err != nil {
@@ -442,10 +445,10 @@ var (
 
 func (api *API) series(r *http.Request) apiFuncResult {
 	if err := r.ParseForm(); err != nil {
-		return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("error parsing form values: %v", err)}, nil, nil}
+		return apiFuncResult{nil, &apiError{errorBadData, errors.Wrapf(err, "error parsing form values")}, nil, nil}
 	}
 	if len(r.Form["match[]"]) == 0 {
-		return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("no match[] parameter provided")}, nil, nil}
+		return apiFuncResult{nil, &apiError{errorBadData, errors.New("no match[] parameter provided")}, nil, nil}
 	}
 
 	var start time.Time
@@ -509,7 +512,7 @@ func (api *API) series(r *http.Request) apiFuncResult {
 }
 
 func (api *API) dropSeries(r *http.Request) apiFuncResult {
-	return apiFuncResult{nil, &apiError{errorInternal, fmt.Errorf("not implemented")}, nil, nil}
+	return apiFuncResult{nil, &apiError{errorInternal, errors.New("not implemented")}, nil, nil}
 }
 
 // Target has the information for one target.
@@ -597,7 +600,7 @@ func (api *API) targetMetadata(r *http.Request) apiFuncResult {
 	if s := r.FormValue("limit"); s != "" {
 		var err error
 		if limit, err = strconv.Atoi(s); err != nil {
-			return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("limit must be a number")}, nil, nil}
+			return apiFuncResult{nil, &apiError{errorBadData, errors.New("limit must be a number")}, nil, nil}
 		}
 	}
 
@@ -808,7 +811,7 @@ func (api *API) rules(r *http.Request) apiFuncResult {
 					Type:      "recording",
 				}
 			default:
-				err := fmt.Errorf("failed to assert type of rule '%v'", rule.Name())
+				err := errors.Errorf("failed to assert type of rule '%v'", rule.Name())
 				return apiFuncResult{nil, &apiError{errorInternal, err}, nil, nil}
 			}
 
@@ -867,11 +870,11 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 		// Change equality matchers which match external labels
 		// to a matcher that looks for an empty label,
 		// as that label should not be present in the storage.
-		externalLabels := api.config().GlobalConfig.ExternalLabels.Clone()
+		externalLabels := api.config().GlobalConfig.ExternalLabels.Map()
 		filteredMatchers := make([]*labels.Matcher, 0, len(matchers))
 		for _, m := range matchers {
-			value := externalLabels[model.LabelName(m.Name)]
-			if m.Type == labels.MatchEqual && value == model.LabelValue(m.Value) {
+			value := externalLabels[m.Name]
+			if m.Type == labels.MatchEqual && value == m.Value {
 				matcher, err := labels.NewMatcher(labels.MatchEqual, m.Name, "")
 				if err != nil {
 					http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -899,9 +902,9 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Add external labels back in, in sorted order.
-		sortedExternalLabels := make([]*prompb.Label, 0, len(externalLabels))
+		sortedExternalLabels := make([]prompb.Label, 0, len(externalLabels))
 		for name, value := range externalLabels {
-			sortedExternalLabels = append(sortedExternalLabels, &prompb.Label{
+			sortedExternalLabels = append(sortedExternalLabels, prompb.Label{
 				Name:  string(name),
 				Value: string(value),
 			})
@@ -923,7 +926,7 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 
 func (api *API) deleteSeries(r *http.Request) apiFuncResult {
 	if !api.enableAdmin {
-		return apiFuncResult{nil, &apiError{errorUnavailable, errors.New("Admin APIs disabled")}, nil, nil}
+		return apiFuncResult{nil, &apiError{errorUnavailable, errors.New("admin APIs disabled")}, nil, nil}
 	}
 	db := api.db()
 	if db == nil {
@@ -931,10 +934,10 @@ func (api *API) deleteSeries(r *http.Request) apiFuncResult {
 	}
 
 	if err := r.ParseForm(); err != nil {
-		return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("error parsing form values: %v", err)}, nil, nil}
+		return apiFuncResult{nil, &apiError{errorBadData, errors.Wrap(err, "error parsing form values")}, nil, nil}
 	}
 	if len(r.Form["match[]"]) == 0 {
-		return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("no match[] parameter provided")}, nil, nil}
+		return apiFuncResult{nil, &apiError{errorBadData, errors.New("no match[] parameter provided")}, nil, nil}
 	}
 
 	var start time.Time
@@ -980,7 +983,7 @@ func (api *API) deleteSeries(r *http.Request) apiFuncResult {
 
 func (api *API) snapshot(r *http.Request) apiFuncResult {
 	if !api.enableAdmin {
-		return apiFuncResult{nil, &apiError{errorUnavailable, errors.New("Admin APIs disabled")}, nil, nil}
+		return apiFuncResult{nil, &apiError{errorUnavailable, errors.New("admin APIs disabled")}, nil, nil}
 	}
 	var (
 		skipHead bool
@@ -989,7 +992,7 @@ func (api *API) snapshot(r *http.Request) apiFuncResult {
 	if r.FormValue("skip_head") != "" {
 		skipHead, err = strconv.ParseBool(r.FormValue("skip_head"))
 		if err != nil {
-			return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("unable to parse boolean 'skip_head' argument: %v", err)}, nil, nil}
+			return apiFuncResult{nil, &apiError{errorBadData, errors.Wrapf(err, "unable to parse boolean 'skip_head' argument")}, nil, nil}
 		}
 	}
 
@@ -1006,10 +1009,10 @@ func (api *API) snapshot(r *http.Request) apiFuncResult {
 		dir = filepath.Join(snapdir, name)
 	)
 	if err := os.MkdirAll(dir, 0777); err != nil {
-		return apiFuncResult{nil, &apiError{errorInternal, fmt.Errorf("create snapshot directory: %s", err)}, nil, nil}
+		return apiFuncResult{nil, &apiError{errorInternal, errors.Wrap(err, "create snapshot directory")}, nil, nil}
 	}
 	if err := db.Snapshot(dir, !skipHead); err != nil {
-		return apiFuncResult{nil, &apiError{errorInternal, fmt.Errorf("create snapshot: %s", err)}, nil, nil}
+		return apiFuncResult{nil, &apiError{errorInternal, errors.Wrap(err, "create snapshot")}, nil, nil}
 	}
 
 	return apiFuncResult{struct {
@@ -1019,7 +1022,7 @@ func (api *API) snapshot(r *http.Request) apiFuncResult {
 
 func (api *API) cleanTombstones(r *http.Request) apiFuncResult {
 	if !api.enableAdmin {
-		return apiFuncResult{nil, &apiError{errorUnavailable, errors.New("Admin APIs disabled")}, nil, nil}
+		return apiFuncResult{nil, &apiError{errorUnavailable, errors.New("admin APIs disabled")}, nil, nil}
 	}
 	db := api.db()
 	if db == nil {
@@ -1060,8 +1063,8 @@ func convertMatcher(m *labels.Matcher) tsdbLabels.Matcher {
 
 // mergeLabels merges two sets of sorted proto labels, preferring those in
 // primary to those in secondary when there is an overlap.
-func mergeLabels(primary, secondary []*prompb.Label) []*prompb.Label {
-	result := make([]*prompb.Label, 0, len(primary)+len(secondary))
+func mergeLabels(primary, secondary []prompb.Label) []prompb.Label {
+	result := make([]prompb.Label, 0, len(primary)+len(secondary))
 	i, j := 0, 0
 	for i < len(primary) && j < len(secondary) {
 		if primary[i].Name < secondary[j].Name {
@@ -1156,21 +1159,21 @@ func parseTime(s string) (time.Time, error) {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t, nil
 	}
-	return time.Time{}, fmt.Errorf("cannot parse %q to a valid timestamp", s)
+	return time.Time{}, errors.Errorf("cannot parse %q to a valid timestamp", s)
 }
 
 func parseDuration(s string) (time.Duration, error) {
 	if d, err := strconv.ParseFloat(s, 64); err == nil {
 		ts := d * float64(time.Second)
 		if ts > float64(math.MaxInt64) || ts < float64(math.MinInt64) {
-			return 0, fmt.Errorf("cannot parse %q to a valid duration. It overflows int64", s)
+			return 0, errors.Errorf("cannot parse %q to a valid duration. It overflows int64", s)
 		}
 		return time.Duration(ts), nil
 	}
 	if d, err := model.ParseDuration(s); err == nil {
 		return time.Duration(d), nil
 	}
-	return 0, fmt.Errorf("cannot parse %q to a valid duration", s)
+	return 0, errors.Errorf("cannot parse %q to a valid duration", s)
 }
 
 func marshalPointJSON(ptr unsafe.Pointer, stream *jsoniter.Stream) {

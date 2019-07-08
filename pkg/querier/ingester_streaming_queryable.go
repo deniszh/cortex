@@ -54,7 +54,12 @@ func (i ingesterQueryable) Get(ctx context.Context, from, through model.Time, ma
 
 	chunks := make([]chunk.Chunk, 0, len(results))
 	for _, result := range results {
-		metric := client.FromLabelPairs(result.Labels)
+		// Sometimes the ingester can send series that have no data.
+		if len(result.Chunks) == 0 {
+			continue
+		}
+
+		metric := client.FromLabelAdaptersToLabels(result.Labels)
 		cs, err := chunkcompat.FromChunks(userID, metric, result.Chunks)
 		if err != nil {
 			return nil, promql.ErrStorage{Err: err}
@@ -89,12 +94,17 @@ func (q *ingesterStreamingQuerier) Select(sp *storage.SelectParams, matchers ...
 
 	serieses := make([]storage.Series, 0, len(results))
 	for _, result := range results {
+		// Sometimes the ingester can send series that have no data.
+		if len(result.Chunks) == 0 {
+			continue
+		}
+
 		chunks, err := chunkcompat.FromChunks(userID, nil, result.Chunks)
 		if err != nil {
 			return nil, nil, promql.ErrStorage{Err: err}
 		}
 
-		ls := client.FromLabelPairsToLabels(result.Labels)
+		ls := client.FromLabelAdaptersToLabels(result.Labels)
 		sort.Sort(ls)
 		series := &chunkSeries{
 			labels:            ls,

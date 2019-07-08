@@ -16,7 +16,6 @@ import (
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/util/wire"
 )
 
 const (
@@ -38,12 +37,12 @@ var (
 			ResultType: model.ValMatrix.String(),
 			Result: []SampleStream{
 				{
-					Labels: []client.LabelPair{
-						{wire.Bytes("foo"), wire.Bytes("bar")},
+					Labels: []client.LabelAdapter{
+						{Name: "foo", Value: "bar"},
 					},
 					Samples: []client.Sample{
-						{137, 1536673680000},
-						{137, 1536673780000},
+						{Value: 137, TimestampMs: 1536673680000},
+						{Value: 137, TimestampMs: 1536673780000},
 					},
 				},
 			},
@@ -205,10 +204,10 @@ func TestMergeAPIResponses(t *testing.T) {
 						ResultType: matrix,
 						Result: []SampleStream{
 							{
-								Labels: []client.LabelPair{},
+								Labels: []client.LabelAdapter{},
 								Samples: []client.Sample{
-									{0, 0},
-									{1, 1},
+									{Value: 0, TimestampMs: 0},
+									{Value: 1, TimestampMs: 1},
 								},
 							},
 						},
@@ -219,10 +218,10 @@ func TestMergeAPIResponses(t *testing.T) {
 						ResultType: matrix,
 						Result: []SampleStream{
 							{
-								Labels: []client.LabelPair{},
+								Labels: []client.LabelAdapter{},
 								Samples: []client.Sample{
-									{2, 2},
-									{3, 3},
+									{Value: 2, TimestampMs: 2},
+									{Value: 3, TimestampMs: 3},
 								},
 							},
 						},
@@ -235,12 +234,12 @@ func TestMergeAPIResponses(t *testing.T) {
 					ResultType: matrix,
 					Result: []SampleStream{
 						{
-							Labels: []client.LabelPair{},
+							Labels: []client.LabelAdapter{},
 							Samples: []client.Sample{
-								{0, 0},
-								{1, 1},
-								{2, 2},
-								{3, 3},
+								{Value: 0, TimestampMs: 0},
+								{Value: 1, TimestampMs: 1},
+								{Value: 2, TimestampMs: 2},
+								{Value: 3, TimestampMs: 3},
 							},
 						},
 					},
@@ -260,19 +259,41 @@ func TestMergeAPIResponses(t *testing.T) {
 					ResultType: matrix,
 					Result: []SampleStream{
 						{
-							Labels: []client.LabelPair{{Name: []byte("a"), Value: []byte("b")}, {Name: []byte("c"), Value: []byte("d")}},
+							Labels: []client.LabelAdapter{{Name: "a", Value: "b"}, {Name: "c", Value: "d"}},
 							Samples: []client.Sample{
-								{0, 0},
-								{1, 1000},
-								{2, 2000},
-								{3, 3000},
+								{Value: 0, TimestampMs: 0},
+								{Value: 1, TimestampMs: 1000},
+								{Value: 2, TimestampMs: 2000},
+								{Value: 3, TimestampMs: 3000},
 							},
 						},
 					},
 				},
 			},
 		},
-	} {
+		// Merging of samples where there is overlap.
+		{
+			input: []*APIResponse{
+				mustParse(t, `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"a":"b","c":"d"},"values":[[1,"1"],[2,"2"]]}]}}`),
+				mustParse(t, `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"c":"d","a":"b"},"values":[[2,"2"],[3,"3"]]}]}}`),
+			},
+			expected: &APIResponse{
+				Status: statusSuccess,
+				Data: QueryRangeResponse{
+					ResultType: matrix,
+					Result: []SampleStream{
+						{
+							Labels: []client.LabelAdapter{{Name: "a", Value: "b"}, {Name: "c", Value: "d"}},
+							Samples: []client.Sample{
+								{Value: 1, TimestampMs: 1000},
+								{Value: 2, TimestampMs: 2000},
+								{Value: 3, TimestampMs: 3000},
+							},
+						},
+					},
+				},
+			},
+		}} {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			output, err := mergeAPIResponses(tc.input)
 			require.NoError(t, err)

@@ -12,9 +12,10 @@ spec:
     spec:
       containers:
       - name: ruler
-        image: quay.io/cortexproject/ruler
+        image: quay.io/cortexproject/cortex
         imagePullPolicy: IfNotPresent
         args:
+        - -target=ruler
         - -log.level=debug
         - -server.http-listen-port=80
         - -ruler.configs.url=http://configs.default.svc.cluster.local:80

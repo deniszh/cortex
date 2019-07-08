@@ -6,6 +6,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 
 	"github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
@@ -23,7 +24,7 @@ func init() {
 }
 
 type memorySeries struct {
-	metric sortedLabelPairs
+	metric labels.Labels
 
 	// Sorted by start time, overlapping chunk ranges are forbidden.
 	chunkDescs []*desc
@@ -50,16 +51,11 @@ func (error *memorySeriesError) Error() string {
 
 // newMemorySeries returns a pointer to a newly allocated memorySeries for the
 // given metric.
-func newMemorySeries(m labelPairs) *memorySeries {
+func newMemorySeries(m labels.Labels) *memorySeries {
 	return &memorySeries{
-		metric:   m.copyValuesAndSort(),
+		metric:   m,
 		lastTime: model.Earliest,
 	}
-}
-
-// helper to extract the not-necessarily-sorted type used elsewhere, without casting everywhere.
-func (s *memorySeries) labels() labelPairs {
-	return labelPairs(s.metric)
 }
 
 // add adds a sample pair to the series. It returns the number of newly
@@ -67,16 +63,19 @@ func (s *memorySeries) labels() labelPairs {
 //
 // The caller must have locked the fingerprint of the series.
 func (s *memorySeries) add(v model.SamplePair) error {
-	// Don't report "no-op appends", i.e. where timestamp and sample
-	// value are the same as for the last append, as they are a
-	// common occurrence when using client-side timestamps
-	// (e.g. Pushgateway or federation).
-	if s.lastSampleValueSet &&
-		v.Timestamp == s.lastTime &&
-		v.Value.Equal(s.lastSampleValue) {
-		return nil
-	}
+	// If sender has repeated the same timestamp, check more closely and perhaps return error.
 	if v.Timestamp == s.lastTime {
+		// If we don't know what the last sample value is, silently discard.
+		// This will mask some errors but better than complaining when we don't really know.
+		if !s.lastSampleValueSet {
+			return nil
+		}
+		// If both timestamp and sample value are the same as for the last append,
+		// ignore as they are a common occurrence when using client-side timestamps
+		// (e.g. Pushgateway or federation).
+		if v.Value.Equal(s.lastSampleValue) {
+			return nil
+		}
 		return &memorySeriesError{
 			message:   fmt.Sprintf("sample with repeated timestamp but different value for series %v; last value: %v, incoming value: %v", s.metric, s.lastSampleValue, v.Value),
 			errorType: "new-value-for-timestamp",

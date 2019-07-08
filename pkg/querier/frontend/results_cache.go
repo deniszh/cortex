@@ -9,6 +9,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 	"github.com/go-kit/kit/log/level"
 	"github.com/gogo/protobuf/proto"
 	opentracing "github.com/opentracing/opentracing-go"
@@ -17,33 +18,37 @@ import (
 	"github.com/weaveworks/common/user"
 )
 
-type resultsCacheConfig struct {
-	cacheConfig       cache.Config
-	MaxCacheFreshness time.Duration
+// ResultsCacheConfig is the config for the results cache.
+type ResultsCacheConfig struct {
+	CacheConfig       cache.Config  `yaml:"cache"`
+	MaxCacheFreshness time.Duration `yaml:"max_freshness"`
 }
 
-func (cfg *resultsCacheConfig) RegisterFlags(f *flag.FlagSet) {
-	cfg.cacheConfig.RegisterFlagsWithPrefix("", "", f)
+// RegisterFlags registers flags.
+func (cfg *ResultsCacheConfig) RegisterFlags(f *flag.FlagSet) {
+	cfg.CacheConfig.RegisterFlagsWithPrefix("frontend.", "", f)
 	f.DurationVar(&cfg.MaxCacheFreshness, "frontend.max-cache-freshness", 1*time.Minute, "Most recent allowed cacheable result, to prevent caching very recent results that might still be in flux.")
 }
 
 type resultsCache struct {
-	cfg   resultsCacheConfig
-	next  queryRangeHandler
-	cache cache.Cache
+	cfg    ResultsCacheConfig
+	next   queryRangeHandler
+	cache  cache.Cache
+	limits *validation.Overrides
 }
 
-func newResultsCacheMiddleware(cfg resultsCacheConfig) (queryRangeMiddleware, error) {
-	c, err := cache.New(cfg.cacheConfig)
+func newResultsCacheMiddleware(cfg ResultsCacheConfig, limits *validation.Overrides) (queryRangeMiddleware, error) {
+	c, err := cache.New(cfg.CacheConfig)
 	if err != nil {
 		return nil, err
 	}
 
 	return queryRangeMiddlewareFunc(func(next queryRangeHandler) queryRangeHandler {
 		return &resultsCache{
-			cfg:   cfg,
-			next:  next,
-			cache: cache.NewSnappy(c),
+			cfg:    cfg,
+			next:   next,
+			cache:  cache.NewSnappy(c),
+			limits: limits,
 		}
 	}), nil
 }
@@ -110,7 +115,7 @@ func (s resultsCache) handleHit(ctx context.Context, r *QueryRangeRequest, exten
 		return response, nil, err
 	}
 
-	reqResps, err = doRequests(ctx, s.next, requests)
+	reqResps, err = doRequests(ctx, s.next, requests, s.limits)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -209,7 +214,7 @@ func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
 	sp.LogFields(otlog.Int("bytes", len(bufs[0])))
 
 	if err := proto.Unmarshal(bufs[0], &resp); err != nil {
-		level.Error(util.Logger).Log("msg", "error unmarshaling cached value", "err", err)
+		level.Error(util.Logger).Log("msg", "error unmarshalling cached value", "err", err)
 		sp.LogFields(otlog.Error(err))
 		return nil, false
 	}

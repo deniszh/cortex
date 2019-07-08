@@ -23,7 +23,7 @@ func TestIndex(t *testing.T) {
 		{model.Metric{"foo": "baz", "flip": "flop"}, 1},
 		{model.Metric{"foo": "baz", "flip": "flap"}, 0},
 	} {
-		index.Add(client.ToLabelPairs(entry.m), entry.fp)
+		index.Add(client.FromMetricsToLabelAdapters(entry.m), entry.fp)
 	}
 
 	for _, tc := range []struct {
@@ -46,9 +46,9 @@ func TestIndex(t *testing.T) {
 		assert.Equal(t, tc.fps, index.Lookup(tc.matchers))
 	}
 
-	assert.Equal(t, model.LabelNames{"flip", "foo"}, index.LabelNames())
-	assert.Equal(t, model.LabelValues{"bar", "baz"}, index.LabelValues("foo"))
-	assert.Equal(t, model.LabelValues{"flap", "flop"}, index.LabelValues("flip"))
+	assert.Equal(t, []string{"flip", "foo"}, index.LabelNames())
+	assert.Equal(t, []string{"bar", "baz"}, index.LabelValues("foo"))
+	assert.Equal(t, []string{"flap", "flop"}, index.LabelValues("flip"))
 }
 
 func mustParseMatcher(s string) []*labels.Matcher {

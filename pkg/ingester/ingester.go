@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 
 	cortex_chunk "github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
@@ -35,7 +36,7 @@ const (
 	duplicateSample     = "multiple_values_for_timestamp"
 
 	// Number of timeseries to return in each batch of a QueryStream.
-	queryStreamBatchSize = 10
+	queryStreamBatchSize = 128
 )
 
 var (
@@ -58,29 +59,29 @@ var (
 	queriedSamples = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name: "cortex_ingester_queried_samples",
 		Help: "The total number of samples returned from queries.",
-		// Could easily return 10m samples per query - 10*(8^7) = 20.9m.
-		Buckets: prometheus.ExponentialBuckets(10, 8, 7),
+		// Could easily return 10m samples per query - 10*(8^(8-1)) = 20.9m.
+		Buckets: prometheus.ExponentialBuckets(10, 8, 8),
 	})
 	queriedSeries = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name: "cortex_ingester_queried_series",
 		Help: "The total number of series returned from queries.",
-		// A reasonable upper bound is around 100k - 10*(8^5) = 327k.
-		Buckets: prometheus.ExponentialBuckets(10, 8, 5),
+		// A reasonable upper bound is around 100k - 10*(8^(6-1)) = 327k.
+		Buckets: prometheus.ExponentialBuckets(10, 8, 6),
 	})
 	queriedChunks = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name: "cortex_ingester_queried_chunks",
 		Help: "The total number of chunks returned from queries.",
-		// A small number of chunks per series - 10*(8^6) = 2.6m.
-		Buckets: prometheus.ExponentialBuckets(10, 8, 6),
+		// A small number of chunks per series - 10*(8^(7-1)) = 2.6m.
+		Buckets: prometheus.ExponentialBuckets(10, 8, 7),
 	})
 )
 
 // Config for an Ingester.
 type Config struct {
-	LifecyclerConfig ring.LifecyclerConfig
+	LifecyclerConfig ring.LifecyclerConfig `yaml:"lifecycler,omitempty"`
 
 	// Config for transferring chunks.
-	SearchPendingFor time.Duration
+	MaxTransferRetries int `yaml:"max_transfer_retries,omitempty"`
 
 	// Config for chunk flushing.
 	FlushCheckPeriod  time.Duration
@@ -90,6 +91,7 @@ type Config struct {
 	MaxChunkAge       time.Duration
 	ChunkAgeJitter    time.Duration
 	ConcurrentFlushes int
+	SpreadFlushes     bool
 
 	RateUpdatePeriod time.Duration
 
@@ -101,22 +103,16 @@ type Config struct {
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	cfg.LifecyclerConfig.RegisterFlags(f)
 
-	f.DurationVar(&cfg.SearchPendingFor, "ingester.search-pending-for", 30*time.Second, "Time to spend searching for a pending ingester when shutting down.")
+	f.IntVar(&cfg.MaxTransferRetries, "ingester.max-transfer-retries", 10, "Number of times to try and transfer chunks before falling back to flushing.")
 	f.DurationVar(&cfg.FlushCheckPeriod, "ingester.flush-period", 1*time.Minute, "Period with which to attempt to flush chunks.")
 	f.DurationVar(&cfg.RetainPeriod, "ingester.retain-period", 5*time.Minute, "Period chunks will remain in memory after flushing.")
 	f.DurationVar(&cfg.FlushOpTimeout, "ingester.flush-op-timeout", 1*time.Minute, "Timeout for individual flush operations.")
 	f.DurationVar(&cfg.MaxChunkIdle, "ingester.max-chunk-idle", 5*time.Minute, "Maximum chunk idle time before flushing.")
 	f.DurationVar(&cfg.MaxChunkAge, "ingester.max-chunk-age", 12*time.Hour, "Maximum chunk age before flushing.")
 	f.DurationVar(&cfg.ChunkAgeJitter, "ingester.chunk-age-jitter", 20*time.Minute, "Range of time to subtract from MaxChunkAge to spread out flushes")
+	f.BoolVar(&cfg.SpreadFlushes, "ingester.spread-flushes", false, "If true, spread series flushes across the whole period of MaxChunkAge")
 	f.IntVar(&cfg.ConcurrentFlushes, "ingester.concurrent-flushes", 50, "Number of concurrent goroutines flushing to dynamodb.")
 	f.DurationVar(&cfg.RateUpdatePeriod, "ingester.rate-update-period", 15*time.Second, "Period with which to update the per-user ingestion rates.")
-
-	// DEPRECATED, no-op
-	f.Bool("ingester.reject-old-samples", false, "DEPRECATED. Reject old samples.")
-	f.Duration("ingester.reject-old-samples.max-age", 0, "DEPRECATED. Maximum accepted sample age before rejecting.")
-	f.Int("ingester.validation.max-length-label-name", 0, "DEPRECATED. Maximum length accepted for label names.")
-	f.Int("ingester.validation.max-length-label-value", 0, "DEPRECATED. Maximum length accepted for label value. This setting also applies to the metric name.")
-	f.Int("ingester.max-label-names-per-series", 0, "DEPRECATED. Maximum number of label names per series.")
 }
 
 // Ingester deals with "in flight" chunks.  Based on Prometheus 1.x
@@ -170,7 +166,7 @@ func New(cfg Config, clientConfig client.Config, limits *validation.Overrides, c
 	}
 
 	var err error
-	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i)
+	i.lifecycler, err = ring.NewLifecycler(cfg.LifecyclerConfig, i, "ingester")
 	if err != nil {
 		return nil, err
 	}
@@ -212,8 +208,6 @@ func (i *Ingester) loop() {
 
 // Shutdown beings the process to stop this ingester.
 func (i *Ingester) Shutdown() {
-	i.limits.Stop()
-
 	// First wait for our flush loop to stop.
 	close(i.quit)
 	i.done.Wait()
@@ -344,7 +338,7 @@ func (i *Ingester) Query(ctx old_ctx.Context, req *client.QueryRequest) (*client
 		}
 
 		ts := client.TimeSeries{
-			Labels:  series.metric,
+			Labels:  client.FromLabelsToLabelAdapaters(series.metric),
 			Samples: make([]client.Sample, 0, len(values)),
 		}
 		for _, s := range values {
@@ -355,7 +349,7 @@ func (i *Ingester) Query(ctx old_ctx.Context, req *client.QueryRequest) (*client
 		}
 		result.Timeseries = append(result.Timeseries, ts)
 		return nil
-	})
+	}, nil, 0)
 	queriedSeries.Observe(float64(numSeries))
 	queriedSamples.Observe(float64(numSamples))
 	return result, err
@@ -388,7 +382,6 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 	// that would involve locking all the series & sorting, so until we have
 	// a better solution in the ingesters I'd rather take the hit in the queriers.
 	err = state.forSeriesMatching(stream.Context(), matchers, func(ctx context.Context, _ model.Fingerprint, series *memorySeries) error {
-		numSeries++
 		chunks := make([]*desc, 0, len(series.chunkDescs))
 		for _, chunk := range series.chunkDescs {
 			if !(chunk.FirstTime.After(through) || chunk.LastTime.Before(from)) {
@@ -396,6 +389,11 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 			}
 		}
 
+		if len(chunks) == 0 {
+			return nil
+		}
+
+		numSeries++
 		wireChunks, err := toWireChunks(chunks)
 		if err != nil {
 			return err
@@ -403,26 +401,23 @@ func (i *Ingester) QueryStream(req *client.QueryRequest, stream client.Ingester_
 
 		numChunks += len(wireChunks)
 		batch = append(batch, client.TimeSeriesChunk{
-			Labels: series.metric,
+			Labels: client.FromLabelsToLabelAdapaters(series.metric),
 			Chunks: wireChunks,
 		})
 
-		if len(batch) >= queryStreamBatchSize {
-			err = stream.Send(&client.QueryStreamResponse{
-				Timeseries: batch,
-			})
-			batch = batch[:0]
+		return nil
+	}, func(ctx context.Context) error {
+		if len(batch) == 0 {
+			return nil
 		}
-		return err
-	})
-	if err != nil {
-		return err
-	}
-
-	if len(batch) > 0 {
 		err = stream.Send(&client.QueryStreamResponse{
 			Timeseries: batch,
 		})
+		batch = batch[:0]
+		return err
+	}, queryStreamBatchSize)
+	if err != nil {
+		return err
 	}
 
 	queriedSeries.Observe(float64(numSeries))
@@ -444,8 +439,8 @@ func (i *Ingester) LabelValues(ctx old_ctx.Context, req *client.LabelValuesReque
 	}
 
 	resp := &client.LabelValuesResponse{}
-	for _, v := range state.index.LabelValues(model.LabelName(req.LabelName)) {
-		resp.LabelValues = append(resp.LabelValues, string(v))
+	for _, v := range state.index.LabelValues(req.LabelName) {
+		resp.LabelValues = append(resp.LabelValues, v)
 	}
 
 	return resp, nil
@@ -464,7 +459,7 @@ func (i *Ingester) LabelNames(ctx old_ctx.Context, req *client.LabelNamesRequest
 
 	resp := &client.LabelNamesResponse{}
 	for _, v := range state.index.LabelNames() {
-		resp.LabelNames = append(resp.LabelNames, string(v))
+		resp.LabelNames = append(resp.LabelNames, v)
 	}
 
 	return resp, nil
@@ -487,23 +482,23 @@ func (i *Ingester) MetricsForLabelMatchers(ctx old_ctx.Context, req *client.Metr
 		return nil, err
 	}
 
-	metrics := map[model.Fingerprint]labelPairs{}
+	lss := map[model.Fingerprint]labels.Labels{}
 	for _, matchers := range matchersSet {
 		if err := state.forSeriesMatching(ctx, matchers, func(ctx context.Context, fp model.Fingerprint, series *memorySeries) error {
-			if _, ok := metrics[fp]; !ok {
-				metrics[fp] = series.labels()
+			if _, ok := lss[fp]; !ok {
+				lss[fp] = series.metric
 			}
 			return nil
-		}); err != nil {
+		}, nil, 0); err != nil {
 			return nil, err
 		}
 	}
 
 	result := &client.MetricsForLabelMatchersResponse{
-		Metric: make([]*client.Metric, 0, len(metrics)),
+		Metric: make([]*client.Metric, 0, len(lss)),
 	}
-	for _, metric := range metrics {
-		result.Metric = append(result.Metric, &client.Metric{Labels: metric})
+	for _, ls := range lss {
+		result.Metric = append(result.Metric, &client.Metric{Labels: client.FromLabelsToLabelAdapaters(ls)})
 	}
 
 	return result, nil
@@ -569,9 +564,9 @@ func (i *Ingester) Watch(in *grpc_health_v1.HealthCheckRequest, stream grpc_heal
 // the addition removal of another ingester. Returns 204 when the ingester is
 // ready, 500 otherwise.
 func (i *Ingester) ReadinessHandler(w http.ResponseWriter, r *http.Request) {
-	if i.lifecycler.IsReady(r.Context()) {
+	if err := i.lifecycler.CheckReady(r.Context()); err == nil {
 		w.WriteHeader(http.StatusNoContent)
 	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
+		http.Error(w, "Not ready: "+err.Error(), http.StatusServiceUnavailable)
 	}
 }

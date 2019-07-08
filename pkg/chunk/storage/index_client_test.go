@@ -1,12 +1,15 @@
 package storage
 
 import (
-	"context"
 	"fmt"
+	"strconv"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/stretchr/testify/require"
+	"github.com/cortexproject/cortex/pkg/chunk/cache"
 )
 
 func TestIndexBasic(t *testing.T) {
@@ -16,7 +19,7 @@ func TestIndexBasic(t *testing.T) {
 		for i := 0; i < 30; i++ {
 			batch.Add(tableName, fmt.Sprintf("hash%d", i), []byte(fmt.Sprintf("range%d", i)), nil)
 		}
-		err := client.BatchWrite(context.Background(), batch)
+		err := client.BatchWrite(ctx, batch)
 		require.NoError(t, err)
 
 		// Make sure we get back the correct entries by hash value.
@@ -28,7 +31,7 @@ func TestIndexBasic(t *testing.T) {
 				},
 			}
 			var have []chunk.IndexEntry
-			err := client.QueryPages(context.Background(), entries, func(_ chunk.IndexQuery, read chunk.ReadBatch) bool {
+			err := client.QueryPages(ctx, entries, func(_ chunk.IndexQuery, read chunk.ReadBatch) bool {
 				iter := read.Iterator()
 				for iter.Next() {
 					have = append(have, chunk.IndexEntry{
@@ -103,7 +106,7 @@ func TestQueryPages(t *testing.T) {
 			batch.Add(entry.TableName, entry.HashValue, entry.RangeValue, entry.Value)
 		}
 
-		err := client.BatchWrite(context.Background(), batch)
+		err := client.BatchWrite(ctx, batch)
 		require.NoError(t, err)
 
 		tests := []struct {
@@ -170,7 +173,7 @@ func TestQueryPages(t *testing.T) {
 				run := true
 				for run {
 					var have []chunk.IndexEntry
-					err = client.QueryPages(context.Background(), []chunk.IndexQuery{tt.query}, func(_ chunk.IndexQuery, read chunk.ReadBatch) bool {
+					err = client.QueryPages(ctx, []chunk.IndexQuery{tt.query}, func(_ chunk.IndexQuery, read chunk.ReadBatch) bool {
 						iter := read.Iterator()
 						for iter.Next() {
 							have = append(have, chunk.IndexEntry{
@@ -193,5 +196,34 @@ func TestQueryPages(t *testing.T) {
 				}
 			})
 		}
+	})
+}
+
+func TestCardinalityLimit(t *testing.T) {
+	forAllFixtures(t, func(t *testing.T, client chunk.IndexClient, _ chunk.ObjectClient) {
+		limits, err := defaultLimits()
+		require.NoError(t, err)
+
+		client = newCachingIndexClient(client, cache.NewMockCache(), time.Minute, limits)
+		batch := client.NewWriteBatch()
+		for i := 0; i < 10; i++ {
+			batch.Add(tableName, "bar", []byte(strconv.Itoa(i)), []byte(strconv.Itoa(i)))
+		}
+		err = client.BatchWrite(ctx, batch)
+		require.NoError(t, err)
+
+		var have int
+		err = client.QueryPages(ctx, []chunk.IndexQuery{{
+			TableName: tableName,
+			HashValue: "bar",
+		}}, func(_ chunk.IndexQuery, read chunk.ReadBatch) bool {
+			iter := read.Iterator()
+			for iter.Next() {
+				have++
+			}
+			return true
+		})
+		require.Error(t, err, "cardinality limit exceeded for {}; 10 entries, more than limit of 5")
+		require.Equal(t, 0, have)
 	})
 }

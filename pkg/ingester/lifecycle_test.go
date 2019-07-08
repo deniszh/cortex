@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log/level"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/context"
@@ -19,7 +18,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/ring"
-	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/ring/testutils"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/test"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -29,17 +28,19 @@ import (
 const userID = "1"
 
 func defaultIngesterTestConfig() Config {
-	consul := ring.NewInMemoryKVClient()
+	codec := ring.ProtoCodec{Factory: ring.ProtoDescFactory}
+	consul := ring.NewInMemoryKVClient(codec)
 	cfg := Config{}
 	flagext.DefaultValues(&cfg)
 	cfg.FlushCheckPeriod = 99999 * time.Hour
 	cfg.MaxChunkIdle = 99999 * time.Hour
 	cfg.ConcurrentFlushes = 1
-	cfg.LifecyclerConfig.RingConfig.Mock = consul
+	cfg.LifecyclerConfig.RingConfig.KVStore.Mock = consul
 	cfg.LifecyclerConfig.NumTokens = 1
 	cfg.LifecyclerConfig.ListenPort = func(i int) *int { return &i }(0)
 	cfg.LifecyclerConfig.Addr = "localhost"
 	cfg.LifecyclerConfig.ID = "localhost"
+	cfg.LifecyclerConfig.FinalSleep = 0
 	return cfg
 }
 
@@ -69,7 +70,7 @@ func TestIngesterRestart(t *testing.T) {
 	}
 
 	test.Poll(t, 100*time.Millisecond, 1, func() interface{} {
-		return numTokens(config.LifecyclerConfig.RingConfig.Mock, "localhost")
+		return testutils.NumTokens(config.LifecyclerConfig.RingConfig.KVStore.Mock, "localhost")
 	})
 
 	{
@@ -81,7 +82,7 @@ func TestIngesterRestart(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	test.Poll(t, 100*time.Millisecond, 1, func() interface{} {
-		return numTokens(config.LifecyclerConfig.RingConfig.Mock, "localhost")
+		return testutils.NumTokens(config.LifecyclerConfig.RingConfig.KVStore.Mock, "localhost")
 	})
 }
 
@@ -95,7 +96,6 @@ func TestIngesterTransfer(t *testing.T) {
 	cfg1.LifecyclerConfig.Addr = "ingester1"
 	cfg1.LifecyclerConfig.ClaimOnRollout = true
 	cfg1.LifecyclerConfig.JoinAfter = 0 * time.Second
-	cfg1.SearchPendingFor = 1 * time.Second
 	ing1, err := New(cfg1, defaultClientTestConfig(), limits, nil)
 	require.NoError(t, err)
 
@@ -110,20 +110,34 @@ func TestIngesterTransfer(t *testing.T) {
 		m   = model.Metric{
 			model.MetricNameLabel: "foo",
 		}
+		sampleData = []model.Sample{
+			{
+				Metric:    m,
+				Timestamp: ts,
+				Value:     val,
+			},
+		}
+		expectedResponse = &client.QueryResponse{
+			Timeseries: []client.TimeSeries{
+				{
+					Labels: client.FromMetricsToLabelAdapters(m),
+					Samples: []client.Sample{
+						{
+							Value:       456,
+							TimestampMs: 123000,
+						},
+					},
+				},
+			},
+		}
 	)
 	ctx := user.InjectOrgID(context.Background(), userID)
-	_, err = ing1.Push(ctx, client.ToWriteRequest([]model.Sample{
-		{
-			Metric:    m,
-			Timestamp: ts,
-			Value:     val,
-		},
-	}, client.API))
+	_, err = ing1.Push(ctx, client.ToWriteRequest(sampleData, client.API))
 	require.NoError(t, err)
 
 	// Start a second ingester, but let it go into PENDING
 	cfg2 := defaultIngesterTestConfig()
-	cfg2.LifecyclerConfig.RingConfig.Mock = cfg1.LifecyclerConfig.RingConfig.Mock
+	cfg2.LifecyclerConfig.RingConfig.KVStore.Mock = cfg1.LifecyclerConfig.RingConfig.KVStore.Mock
 	cfg2.LifecyclerConfig.ID = "ingester2"
 	cfg2.LifecyclerConfig.Addr = "ingester2"
 	cfg2.LifecyclerConfig.JoinAfter = 100 * time.Second
@@ -152,19 +166,14 @@ func TestIngesterTransfer(t *testing.T) {
 
 	response, err := ing2.Query(ctx, request)
 	require.NoError(t, err)
-	assert.Equal(t, &client.QueryResponse{
-		Timeseries: []client.TimeSeries{
-			{
-				Labels: client.ToLabelPairs(m),
-				Samples: []client.Sample{
-					{
-						Value:       456,
-						TimestampMs: 123000,
-					},
-				},
-			},
-		},
-	}, response)
+	assert.Equal(t, expectedResponse, response)
+
+	// Check we can send the same sample again to the new ingester and get the same result
+	_, err = ing2.Push(ctx, client.ToWriteRequest(sampleData, client.API))
+	require.NoError(t, err)
+	response, err = ing2.Query(ctx, request)
+	require.NoError(t, err)
+	assert.Equal(t, expectedResponse, response)
 }
 
 func TestIngesterBadTransfer(t *testing.T) {
@@ -177,7 +186,6 @@ func TestIngesterBadTransfer(t *testing.T) {
 	cfg.LifecyclerConfig.Addr = "ingester1"
 	cfg.LifecyclerConfig.ClaimOnRollout = true
 	cfg.LifecyclerConfig.JoinAfter = 100 * time.Second
-	cfg.SearchPendingFor = 1 * time.Second
 	ing, err := New(cfg, defaultClientTestConfig(), limits, nil)
 	require.NoError(t, err)
 
@@ -194,21 +202,6 @@ func TestIngesterBadTransfer(t *testing.T) {
 
 	// Check the ingester is still waiting.
 	require.Equal(t, ring.PENDING, ing.lifecycler.GetState())
-}
-
-func numTokens(c ring.KVClient, name string) int {
-	ringDesc, err := c.Get(context.Background(), ring.ConsulKey)
-	if err != nil {
-		level.Error(util.Logger).Log("msg", "error reading consul", "err", err)
-		return 0
-	}
-	count := 0
-	for _, token := range ringDesc.(*ring.Desc).Tokens {
-		if token.Ingester == name {
-			count++
-		}
-	}
-	return count
 }
 
 type ingesterTransferChunkStreamMock struct {
@@ -289,6 +282,10 @@ func (i ingesterClientAdapater) TransferChunks(ctx context.Context, _ ...grpc.Ca
 
 func (i ingesterClientAdapater) Close() error {
 	return nil
+}
+
+func (i ingesterClientAdapater) Check(ctx context.Context, in *grpc_health_v1.HealthCheckRequest, opts ...grpc.CallOption) (*grpc_health_v1.HealthCheckResponse, error) {
+	return nil, nil
 }
 
 // TestIngesterFlush tries to test that the ingester flushes chunks before

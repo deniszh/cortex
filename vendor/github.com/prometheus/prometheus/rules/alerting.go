@@ -26,6 +26,7 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -71,7 +72,7 @@ func (s AlertState) String() string {
 	case StateFiring:
 		return "firing"
 	}
-	panic(fmt.Errorf("unknown alert state: %v", s.String()))
+	panic(errors.Errorf("unknown alert state: %s", s.String()))
 }
 
 // Alert is the user-level representation of a single instance of an alerting rule.
@@ -204,10 +205,6 @@ func (r *AlertingRule) Labels() labels.Labels {
 // Annotations returns the annotations of the alerting rule.
 func (r *AlertingRule) Annotations() labels.Labels {
 	return r.annotations
-}
-
-func (r *AlertingRule) equal(o *AlertingRule) bool {
-	return r.name == o.name && labels.Equal(r.labels, o.labels)
 }
 
 func (r *AlertingRule) sample(alert *Alert, ts time.Time) promql.Sample {

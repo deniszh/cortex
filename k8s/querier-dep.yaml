@@ -12,9 +12,10 @@ spec:
     spec:
       containers:
       - name: querier
-        image: quay.io/cortexproject/querier
+        image: quay.io/cortexproject/cortex
         imagePullPolicy: IfNotPresent
         args:
+        - -target=querier
         - -server.http-listen-port=80
         - -consul.hostname=consul.default.svc.cluster.local:8500
         - -s3.url=s3://abc:123@s3.default.svc.cluster.local:4569

@@ -12,9 +12,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/weaveworks/common/user"
 )
@@ -187,6 +187,17 @@ func (i *Ingester) shouldFlushChunk(c *desc, fp model.Fingerprint) flushReason {
 		return noFlush
 	}
 
+	if i.cfg.SpreadFlushes {
+		now := model.Now()
+		// Map from the fingerprint hash to a fixed point in the cycle of period MaxChunkAge
+		startOfCycle := now.Add(-(now.Sub(model.Time(0)) % i.cfg.MaxChunkAge))
+		slot := startOfCycle.Add(time.Duration(fp) % i.cfg.MaxChunkAge)
+		// If that point is now, to the resolution of FlushCheckPeriod, flush the chunk.
+		if slot >= now && slot < now.Add(i.cfg.FlushCheckPeriod) {
+			return reasonAged
+		}
+		// If we missed the slot due to timing it will get caught by the MaxChunkAge check below, some time later.
+	}
 	// Adjust max age slightly to spread flushes out over time
 	var jitter time.Duration
 	if i.cfg.ChunkAgeJitter != 0 {
@@ -277,14 +288,14 @@ func (i *Ingester) flushUserSeries(flushQueueIndex int, userID string, fp model.
 	sp.SetTag("organization", userID)
 
 	util.Event().Log("msg", "flush chunks", "userID", userID, "reason", reason, "numChunks", len(chunks), "firstTime", chunks[0].FirstTime, "fp", fp, "series", series.metric, "queue", flushQueueIndex)
-	err := i.flushChunks(ctx, fp, client.FromLabelPairs(series.metric), chunks)
+	err := i.flushChunks(ctx, fp, series.metric, chunks)
 	if err != nil {
 		return err
 	}
 
 	userState.fpLocker.Lock(fp)
 	if immediate {
-		userState.removeSeries(fp, series.labels())
+		userState.removeSeries(fp, series.metric)
 		memoryChunks.Sub(float64(len(chunks)))
 	} else {
 		for i := 0; i < len(chunks); i++ {
@@ -310,11 +321,11 @@ func (i *Ingester) removeFlushedChunks(userState *userState, fp model.Fingerprin
 		}
 	}
 	if len(series.chunkDescs) == 0 {
-		userState.removeSeries(fp, series.labels())
+		userState.removeSeries(fp, series.metric)
 	}
 }
 
-func (i *Ingester) flushChunks(ctx context.Context, fp model.Fingerprint, metric model.Metric, chunkDescs []*desc) error {
+func (i *Ingester) flushChunks(ctx context.Context, fp model.Fingerprint, metric labels.Labels, chunkDescs []*desc) error {
 	userID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return err

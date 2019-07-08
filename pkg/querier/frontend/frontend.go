@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/NYTimes/gziphandler"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	opentracing "github.com/opentracing/opentracing-go"
@@ -49,13 +50,13 @@ var (
 
 // Config for a Frontend.
 type Config struct {
-	MaxOutstandingPerTenant int
-	MaxRetries              int
-	SplitQueriesByDay       bool
-	AlignQueriesWithStep    bool
-	CacheResults            bool
-	CompressResponses       bool
-	resultsCacheConfig
+	MaxOutstandingPerTenant int  `yaml:"max_outstanding_per_tenant"`
+	MaxRetries              int  `yaml:"max_retries"`
+	SplitQueriesByDay       bool `yaml:"split_queries_by_day"`
+	AlignQueriesWithStep    bool `yaml:"align_queries_with_step"`
+	CacheResults            bool `yaml:"cache_results"`
+	CompressResponses       bool `yaml:"compress_responses"`
+	ResultsCacheConfig      `yaml:"results_cache"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
@@ -66,7 +67,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.AlignQueriesWithStep, "querier.align-querier-with-step", false, "Mutate incoming queries to align their start and end with their step.")
 	f.BoolVar(&cfg.CacheResults, "querier.cache-results", false, "Cache query results.")
 	f.BoolVar(&cfg.CompressResponses, "querier.compress-http-responses", false, "Compress HTTP responses.")
-	cfg.resultsCacheConfig.RegisterFlags(f)
+	cfg.ResultsCacheConfig.RegisterFlags(f)
 }
 
 // Frontend queues HTTP requests, dispatches them to backends, and handles retries
@@ -92,7 +93,7 @@ type request struct {
 }
 
 // New creates a new frontend.
-func New(cfg Config, log log.Logger) (*Frontend, error) {
+func New(cfg Config, log log.Logger, limits *validation.Overrides) (*Frontend, error) {
 	f := &Frontend{
 		cfg:    cfg,
 		log:    log,
@@ -105,10 +106,10 @@ func New(cfg Config, log log.Logger) (*Frontend, error) {
 		queryRangeMiddleware = append(queryRangeMiddleware, stepAlignMiddleware)
 	}
 	if cfg.SplitQueriesByDay {
-		queryRangeMiddleware = append(queryRangeMiddleware, splitByDayMiddleware)
+		queryRangeMiddleware = append(queryRangeMiddleware, splitByDayMiddleware(limits))
 	}
 	if cfg.CacheResults {
-		queryCacheMiddleware, err := newResultsCacheMiddleware(cfg.resultsCacheConfig)
+		queryCacheMiddleware, err := newResultsCacheMiddleware(cfg.ResultsCacheConfig, limits)
 		if err != nil {
 			return nil, err
 		}
@@ -123,6 +124,7 @@ func New(cfg Config, log log.Logger) (*Frontend, error) {
 			queryRangeMiddleware: merge(queryRangeMiddleware...).Wrap(&queryRangeTerminator{
 				next: roundTripper,
 			}),
+			limits: limits,
 		}
 	}
 	f.roundTripper = roundTripper

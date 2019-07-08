@@ -129,7 +129,7 @@ func (us *userStates) getViaContext(ctx context.Context) (*userState, bool, erro
 	return state, ok, nil
 }
 
-func (us *userStates) getOrCreateSeries(ctx context.Context, labels labelPairs) (*userState, model.Fingerprint, *memorySeries, error) {
+func (us *userStates) getOrCreateSeries(ctx context.Context, labels []client.LabelAdapter) (*userState, model.Fingerprint, *memorySeries, error) {
 	userID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("no user id")
@@ -198,7 +198,7 @@ func (u *userState) getSeries(metric labelPairs) (model.Fingerprint, *memorySeri
 		return fp, nil, httpgrpc.Errorf(http.StatusTooManyRequests, "per-user series limit (%d) exceeded", u.limits.MaxSeriesPerUser(u.userID))
 	}
 
-	metricName, err := extract.MetricNameFromLabelPairs(metric)
+	metricName, err := extract.MetricNameFromLabelAdapters(metric)
 	if err != nil {
 		u.fpLocker.Unlock(fp)
 		return fp, nil, err
@@ -213,9 +213,9 @@ func (u *userState) getSeries(metric labelPairs) (model.Fingerprint, *memorySeri
 	u.memSeriesCreatedTotal.Inc()
 	memSeries.Inc()
 
-	series = newMemorySeries(metric)
+	labels := u.index.Add(metric, fp)
+	series = newMemorySeries(labels)
 	u.fpToSeries.put(fp, series)
-	u.index.Add(metric, fp)
 
 	return fp, series, nil
 }
@@ -232,17 +232,16 @@ func (u *userState) canAddSeriesFor(metric string) bool {
 	return true
 }
 
-func (u *userState) removeSeries(fp model.Fingerprint, metric labelPairs) {
+func (u *userState) removeSeries(fp model.Fingerprint, metric labels.Labels) {
 	u.fpToSeries.del(fp)
-	u.index.Delete(metric, fp)
+	u.index.Delete(labels.Labels(metric), fp)
 
-	metricNameB, err := extract.MetricNameFromLabelPairs(metric)
-	if err != nil {
+	metricName := metric.Get(model.MetricNameLabel)
+	if metricName == "" {
 		// Series without a metric name should never be able to make it into
 		// the ingester's memory storage.
-		panic(err)
+		panic("No metric name label")
 	}
-	metricName := string(metricNameB)
 
 	shard := &u.seriesInMetric[util.HashFP(model.Fingerprint(fnv1a.HashString64(string(metricName))))%metricCounterShards]
 	shard.mtx.Lock()
@@ -257,9 +256,18 @@ func (u *userState) removeSeries(fp model.Fingerprint, metric labelPairs) {
 	memSeries.Dec()
 }
 
-// forSeriesMatching passes all series matching the given matchers to the provided callback.
-// Deals with locking and the quirks of zero-length matcher values.
-func (u *userState) forSeriesMatching(ctx context.Context, allMatchers []*labels.Matcher, callback func(context.Context, model.Fingerprint, *memorySeries) error) error {
+// forSeriesMatching passes all series matching the given matchers to the
+// provided callback. Deals with locking and the quirks of zero-length matcher
+// values. There are 2 callbacks:
+// - The `add` callback is called for each series while the lock is held, and
+//   is intend to be used by the caller to build a batch.
+// - The `send` callback is called at certain intervals specified by batchSize
+//   with no locks held, and is intended to be used by the caller to send the
+//   built batches.
+func (u *userState) forSeriesMatching(ctx context.Context, allMatchers []*labels.Matcher,
+	add func(context.Context, model.Fingerprint, *memorySeries) error,
+	send func(context.Context) error, batchSize int,
+) error {
 	log, ctx := spanlogger.New(ctx, "forSeriesMatching")
 	defer log.Finish()
 
@@ -271,7 +279,8 @@ func (u *userState) forSeriesMatching(ctx context.Context, allMatchers []*labels
 
 	level.Debug(log).Log("series", len(fps))
 
-	// fps is sorted, lock them in order to prevent deadlocks
+	// We only hold one FP lock at once here, so no opportunity to deadlock.
+	sent := 0
 outer:
 	for _, fp := range fps {
 		if err := ctx.Err(); err != nil {
@@ -286,18 +295,28 @@ outer:
 		}
 
 		for _, filter := range filters {
-			if !filter.Matches(string(series.metric.valueForName([]byte(filter.Name)))) {
+			if !filter.Matches(series.metric.Get(filter.Name)) {
 				u.fpLocker.Unlock(fp)
 				continue outer
 			}
 		}
 
-		err := callback(ctx, fp, series)
+		err := add(ctx, fp, series)
 		u.fpLocker.Unlock(fp)
 		if err != nil {
 			return err
 		}
+
+		sent++
+		if batchSize > 0 && sent%batchSize == 0 && send != nil {
+			if err = send(ctx); err != nil {
+				return nil
+			}
+		}
 	}
 
+	if batchSize > 0 && sent%batchSize > 0 && send != nil {
+		return send(ctx)
+	}
 	return nil
 }

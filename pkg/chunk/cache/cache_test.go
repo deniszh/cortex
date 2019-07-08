@@ -3,8 +3,6 @@ package cache_test
 import (
 	"context"
 	"math/rand"
-	"os"
-	"path"
 	"sort"
 	"strconv"
 	"testing"
@@ -14,6 +12,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
 	prom_chunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,9 +34,9 @@ func fillCache(t *testing.T, cache cache.Cache) ([]string, []chunk.Chunk) {
 		c := chunk.NewChunk(
 			userID,
 			model.Fingerprint(1),
-			model.Metric{
-				model.MetricNameLabel: "foo",
-				"bar": "baz",
+			labels.Labels{
+				{Name: model.MetricNameLabel, Value: "foo"},
+				{Name: "bar", Value: "baz"},
 			},
 			promChunk[0],
 			ts,
@@ -97,7 +96,7 @@ func testCacheMultiple(t *testing.T, cache cache.Cache, keys []string, chunks []
 func testChunkFetcher(t *testing.T, c cache.Cache, keys []string, chunks []chunk.Chunk) {
 	fetcher, err := chunk.NewChunkFetcher(cache.Config{
 		Cache: c,
-	}, nil)
+	}, false, nil)
 	require.NoError(t, err)
 	defer fetcher.Stop()
 
@@ -153,19 +152,6 @@ func TestMemcache(t *testing.T) {
 		}, newMockMemcache(), "test")
 		testCache(t, cache)
 	})
-}
-
-func TestDiskcache(t *testing.T) {
-	dirname := os.TempDir()
-	filename := path.Join(dirname, "diskcache")
-	defer os.RemoveAll(filename)
-
-	cache, err := cache.NewDiskcache(cache.DiskcacheConfig{
-		Path: filename,
-		Size: 100 * 1024 * 1024,
-	})
-	require.NoError(t, err)
-	testCache(t, cache)
 }
 
 func TestFifoCache(t *testing.T) {

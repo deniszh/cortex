@@ -14,8 +14,9 @@
 package promql
 
 import (
-	"fmt"
 	"time"
+
+	"github.com/pkg/errors"
 
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -260,6 +261,11 @@ func Walk(v Visitor, node Node, path []Node) error {
 			}
 		}
 	case *AggregateExpr:
+		if n.Param != nil {
+			if err := Walk(v, n.Param, path); err != nil {
+				return err
+			}
+		}
 		if err := Walk(v, n.Expr, path); err != nil {
 			return err
 		}
@@ -296,7 +302,7 @@ func Walk(v Visitor, node Node, path []Node) error {
 		// nothing to do
 
 	default:
-		panic(fmt.Errorf("promql.Walk: unhandled node type %T", node))
+		panic(errors.Errorf("promql.Walk: unhandled node type %T", node))
 	}
 
 	_, err = v.Visit(nil, nil)
@@ -306,11 +312,11 @@ func Walk(v Visitor, node Node, path []Node) error {
 type inspector func(Node, []Node) error
 
 func (f inspector) Visit(node Node, path []Node) (Visitor, error) {
-	if err := f(node, path); err == nil {
-		return f, nil
-	} else {
+	if err := f(node, path); err != nil {
 		return nil, err
 	}
+
+	return f, nil
 }
 
 // Inspect traverses an AST in depth-first order: It starts by calling
